@@ -270,14 +270,14 @@ fn generate_bars_rgba(
     weekly_pct: f64,
     weekly_color: UsageColor,
 ) -> (Vec<u8>, u32, u32) {
-    let width = 36u32;
-    let height = 22u32;
-    let bar_x = 2u32;
-    let bar_w = 32u32;
-    let bar_h = 7u32;
-    let radius = 3.0f64;
-    let top_y = 3u32;
-    let bottom_y = top_y + bar_h + 2;
+    // macOS menu bar: wide rectangle; Windows system tray: square
+    let (width, height, bar_x, bar_w, bar_h, radius, top_y, gap) = if cfg!(target_os = "macos") {
+        (36u32, 22u32, 2u32, 32u32, 7u32, 3.0f64, 3u32, 2u32)
+    } else {
+        // Windows: 32x32 square icon
+        (32u32, 32u32, 2u32, 28u32, 10u32, 4.0f64, 4u32, 4u32)
+    };
+    let bottom_y = top_y + bar_h + gap;
     let track = (68u8, 68, 72);
 
     let mut rgba = vec![0u8; (width * height * 4) as usize];
@@ -296,14 +296,26 @@ fn generate_bars_rgba(
     (rgba, width, height)
 }
 
+const POPUP_WIDTH: f64 = 360.0;
+const POPUP_HEIGHT: f64 = 120.0;
+
+fn popup_position(pos: &tauri::PhysicalPosition<f64>) -> tauri::PhysicalPosition<i32> {
+    let x = (pos.x as i32).saturating_sub((POPUP_WIDTH / 2.0) as i32);
+    let y = if cfg!(target_os = "macos") {
+        // macOS: taskbar at top, popup below tray
+        pos.y as i32
+    } else {
+        // Windows: taskbar at bottom, popup above tray
+        (pos.y as i32).saturating_sub(POPUP_HEIGHT as i32 + 10)
+    };
+    tauri::PhysicalPosition { x: x.max(0), y: y.max(0) }
+}
+
 fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
     if let Some(window) = app.get_webview_window("popup") {
         // Position near tray icon if we have coords
         if let Some(pos) = position {
-            let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-                x: (pos.x as i32).saturating_sub(180),
-                y: pos.y as i32,
-            }));
+            let _ = window.set_position(tauri::Position::Physical(popup_position(&pos)));
         }
         let _ = window.show();
         let _ = window.set_focus();
@@ -319,7 +331,7 @@ fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
     let mut builder =
         WebviewWindowBuilder::new(app, "popup", WebviewUrl::App("index.html".into()))
             .title("Claude Meter")
-            .inner_size(360.0, 120.0)
+            .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
             .resizable(false)
             .decorations(false)
             .always_on_top(true)
@@ -329,10 +341,8 @@ fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
 
     // Position near tray icon
     if let Some(pos) = position {
-        builder = builder.position(
-            (pos.x - 180.0).max(0.0),
-            pos.y,
-        );
+        let p = popup_position(&pos);
+        builder = builder.position(p.x as f64, p.y as f64);
     }
 
     if let Ok(window) = builder.build() {
