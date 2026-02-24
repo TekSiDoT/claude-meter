@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod updater;
 pub mod usage;
 
 use api::ClaudeClient;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub usage: Mutex<Option<UsageState>>,
     pub blink_active: Arc<AtomicBool>,
     pub polling_active: Arc<AtomicBool>,
+    pub update_available: Mutex<Option<updater::UpdateInfo>>,
 }
 
 #[tauri::command]
@@ -367,6 +369,59 @@ fn apply_login_credentials(app: &AppHandle, session_key: String, org_id: String)
     start_polling_loop(app);
 }
 
+fn build_tray_menu(
+    app: &AppHandle,
+    update: Option<&updater::UpdateInfo>,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let mut builder = MenuBuilder::new(app);
+
+    if let Some(info) = update {
+        let label = format!("\u{2B06} Update v{} available", info.version);
+        let update_item = MenuItemBuilder::with_id("update", label).build(app)?;
+        builder = builder.item(&update_item).separator();
+    }
+
+    let refresh = MenuItemBuilder::with_id("refresh", "Refresh Now").build(app)?;
+    let open_claude =
+        MenuItemBuilder::with_id("open_claude", "Open claude.ai Usage").build(app)?;
+    let settings = MenuItemBuilder::with_id("settings", "Settings...").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit Claude Meter").build(app)?;
+
+    builder
+        .item(&refresh)
+        .separator()
+        .item(&open_claude)
+        .item(&settings)
+        .separator()
+        .item(&quit)
+        .build()
+}
+
+fn start_update_check_loop(app: &AppHandle) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Some(info) = updater::check_for_update().await {
+                let state = app_handle.state::<AppState>();
+                let update_clone = {
+                    let mut update = state.update_available.lock().unwrap();
+                    *update = Some(info);
+                    update.clone()
+                };
+                if let Some(tray) = app_handle.tray_by_id("main-tray") {
+                    if let Ok(menu) =
+                        build_tray_menu(&app_handle, update_clone.as_ref())
+                    {
+                        let _ = tray.set_menu(Some(menu));
+                    }
+                }
+            }
+            // Re-check every 6 hours
+            tokio::time::sleep(tokio::time::Duration::from_secs(6 * 60 * 60)).await;
+        }
+    });
+}
+
 const POPUP_WIDTH: f64 = 360.0;
 const POPUP_HEIGHT: f64 = 120.0;
 
@@ -475,26 +530,11 @@ pub fn run() {
                 usage: Mutex::new(None),
                 blink_active: blink_active.clone(),
                 polling_active: polling_active.clone(),
+                update_available: Mutex::new(None),
             });
 
-            // Build tray menu
-            let refresh_item =
-                MenuItemBuilder::with_id("refresh", "Refresh Now").build(app)?;
-            let open_claude =
-                MenuItemBuilder::with_id("open_claude", "Open claude.ai Usage").build(app)?;
-            let settings_item =
-                MenuItemBuilder::with_id("settings", "Settings...").build(app)?;
-            let quit_item =
-                MenuItemBuilder::with_id("quit", "Quit Claude Meter").build(app)?;
-
-            let menu = MenuBuilder::new(app)
-                .item(&refresh_item)
-                .separator()
-                .item(&open_claude)
-                .item(&settings_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
+            // Build tray menu (no update info yet)
+            let menu = build_tray_menu(app.handle(), None)?;
 
             // Create initial icon — empty gray bars
             let (rgba, icon_w, icon_h) = generate_bars_rgba(
@@ -509,6 +549,15 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .menu(&menu)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "update" => {
+                        let url = app.state::<AppState>()
+                            .update_available.lock().unwrap()
+                            .as_ref()
+                            .map(|info| info.url.clone());
+                        if let Some(url) = url {
+                            let _ = app.opener().open_url(&url, None::<&str>);
+                        }
+                    }
                     "refresh" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
@@ -605,6 +654,9 @@ pub fn run() {
             } else {
                 start_polling_loop(app.handle());
             }
+
+            // Check for updates in background
+            start_update_check_loop(app.handle());
 
             Ok(())
         })
