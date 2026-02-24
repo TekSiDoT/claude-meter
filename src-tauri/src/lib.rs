@@ -21,6 +21,7 @@ pub struct AppState {
     pub client: Mutex<Option<ClaudeClient>>,
     pub usage: Mutex<Option<UsageState>>,
     pub blink_active: Arc<AtomicBool>,
+    pub polling_active: Arc<AtomicBool>,
 }
 
 #[tauri::command]
@@ -31,32 +32,11 @@ fn get_usage(state: tauri::State<'_, AppState>) -> Option<UsageState> {
 #[tauri::command]
 fn save_config(
     app: AppHandle,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     session_key: String,
     org_id: String,
 ) -> Result<String, String> {
-    let mut config = state.config.lock().unwrap();
-    config.session_key = session_key.clone();
-    config.org_id = org_id.clone();
-
-    // Persist to store
-    persist_config(&app, &config);
-
-    // Initialize the API client
-    let client = ClaudeClient::new(&session_key, &org_id);
-    *state.client.lock().unwrap() = Some(client);
-
-    // Close setup window if open
-    if let Some(window) = app.get_webview_window("setup") {
-        let _ = window.close();
-    }
-
-    // Trigger immediate fetch
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        poll_usage(&app_handle).await;
-    });
-
+    apply_login_credentials(&app, session_key, org_id);
     Ok("Configuration saved".to_string())
 }
 
@@ -79,9 +59,44 @@ fn hide_popup(app: AppHandle) {
     }
 }
 
+const KEYCHAIN_SERVICE: &str = "com.claude-meter.app";
+const KEYCHAIN_USER: &str = "session_key";
+
+fn save_session_key_to_keychain(session_key: &str) {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        Ok(entry) => {
+            if let Err(e) = entry.set_password(session_key) {
+                eprintln!("[keychain] set_password failed: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("[keychain] Entry::new failed: {}", e);
+        }
+    }
+}
+
+fn load_session_key_from_keychain() -> Option<String> {
+    match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+        Ok(entry) => match entry.get_password() {
+            Ok(pw) => Some(pw),
+            Err(e) => {
+                eprintln!("[keychain] get_password failed: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("[keychain] Entry::new failed: {}", e);
+            None
+        }
+    }
+}
+
 fn persist_config(app: &AppHandle, config: &AppConfig) {
+    // Session key goes to OS keychain
+    save_session_key_to_keychain(&config.session_key);
+
+    // Non-secret config goes to store
     if let Ok(store) = app.store("config.json") {
-        store.set("session_key", serde_json::json!(config.session_key));
         store.set("org_id", serde_json::json!(config.org_id));
         store.set(
             "poll_interval_secs",
@@ -92,12 +107,14 @@ fn persist_config(app: &AppHandle, config: &AppConfig) {
 
 fn load_config(app: &AppHandle) -> AppConfig {
     let mut config = AppConfig::default();
+
+    // Load session key from OS keychain
+    if let Some(sk) = load_session_key_from_keychain() {
+        config.session_key = sk;
+    }
+
+    // Load non-secret config from store
     if let Ok(store) = app.store("config.json") {
-        if let Some(val) = store.get("session_key") {
-            if let Some(s) = val.as_str() {
-                config.session_key = s.to_string();
-            }
-        }
         if let Some(val) = store.get("org_id") {
             if let Some(s) = val.as_str() {
                 config.org_id = s.to_string();
@@ -109,6 +126,22 @@ fn load_config(app: &AppHandle) -> AppConfig {
             }
         }
     }
+
+    // Migrate: if session_key is still in store, move it to keychain
+    if config.session_key.is_empty() {
+        if let Ok(store) = app.store("config.json") {
+            if let Some(val) = store.get("session_key") {
+                if let Some(s) = val.as_str() {
+                    if !s.is_empty() {
+                        config.session_key = s.to_string();
+                        save_session_key_to_keychain(s);
+                        store.delete("session_key");
+                    }
+                }
+            }
+        }
+    }
+
     config
 }
 
@@ -296,6 +329,44 @@ fn generate_bars_rgba(
     (rgba, width, height)
 }
 
+fn start_polling_loop(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    // Only start once
+    if state.polling_active.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        poll_usage(&app_handle).await;
+        let state = app_handle.state::<AppState>();
+        let interval = state.config.lock().unwrap().poll_interval_secs;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            poll_usage(&app_handle).await;
+        }
+    });
+}
+
+fn apply_login_credentials(app: &AppHandle, session_key: String, org_id: String) {
+    let state = app.state::<AppState>();
+    {
+        let mut config = state.config.lock().unwrap();
+        config.session_key = session_key.clone();
+        config.org_id = org_id.clone();
+        persist_config(app, &config);
+    }
+
+    let client = ClaudeClient::new(&session_key, &org_id);
+    *state.client.lock().unwrap() = Some(client);
+
+    // Close setup window
+    if let Some(w) = app.get_webview_window("setup") {
+        let _ = w.close();
+    }
+
+    start_polling_loop(app);
+}
+
 const POPUP_WIDTH: f64 = 360.0;
 const POPUP_HEIGHT: f64 = 120.0;
 
@@ -345,7 +416,7 @@ fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
         builder = builder.position(p.x as f64, p.y as f64);
     }
 
-    if let Ok(window) = builder.build() {
+    if let Ok(_window) = builder.build() {
         // Emit data after a short delay to let webview initialize
         let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -356,16 +427,7 @@ fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
                 let _ = app_handle.emit("usage-updated", &usage_state);
             }
         });
-
-        // Close popup when it loses focus
-        let app_handle = app.clone();
-        window.on_window_event(move |event| {
-            if let tauri::WindowEvent::Focused(false) = event {
-                if let Some(w) = app_handle.get_webview_window("popup") {
-                    let _ = w.hide();
-                }
-            }
-        });
+        // No focus-loss auto-hide — tray click toggle handles show/hide
     }
 }
 
@@ -405,11 +467,14 @@ pub fn run() {
 
             let blink_active = Arc::new(AtomicBool::new(false));
 
+            let polling_active = Arc::new(AtomicBool::new(false));
+
             app.manage(AppState {
                 config: Mutex::new(config.clone()),
                 client: Mutex::new(client),
                 usage: Mutex::new(None),
                 blink_active: blink_active.clone(),
+                polling_active: polling_active.clone(),
             });
 
             // Build tray menu
@@ -457,7 +522,7 @@ pub fn run() {
                         show_setup(app);
                     }
                     "quit" => {
-                        app.exit(0);
+                        std::process::exit(0);
                     }
                     _ => {}
                 })
@@ -469,7 +534,18 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        show_popup(tray.app_handle(), Some(position));
+                        let app = tray.app_handle();
+                        let visible = app.get_webview_window("popup")
+                            .map(|w| w.is_visible().unwrap_or(false))
+                            .unwrap_or(false);
+
+                        if visible {
+                            if let Some(w) = app.get_webview_window("popup") {
+                                let _ = w.hide();
+                            }
+                            return;
+                        }
+                        show_popup(app, Some(position));
                     }
                 })
                 .build(app)?;
@@ -506,21 +582,28 @@ pub fn run() {
                 });
             }
 
-            // Show setup if not configured
+            // Pre-create popup window (hidden) so it's loaded on first tray click
+            {
+                let _ = WebviewWindowBuilder::new(
+                    app.handle(),
+                    "popup",
+                    WebviewUrl::App("index.html".into()),
+                )
+                .title("Claude Meter")
+                .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
+                .resizable(false)
+                .decorations(false)
+                .always_on_top(true)
+                .visible(false)
+                .skip_taskbar(true)
+                .build();
+            }
+
+            // Show setup if not configured, otherwise start polling
             if !config.is_configured() {
                 show_setup(app.handle());
             } else {
-                // Start polling
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    poll_usage(&app_handle).await;
-                    let state = app_handle.state::<AppState>();
-                    let interval = state.config.lock().unwrap().poll_interval_secs;
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-                        poll_usage(&app_handle).await;
-                    }
-                });
+                start_polling_loop(app.handle());
             }
 
             Ok(())
@@ -532,6 +615,12 @@ pub fn run() {
             refresh_now,
             hide_popup,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // Prevent app from exiting when all windows close — we're a tray app
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
