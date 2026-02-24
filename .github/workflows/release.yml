@@ -49,7 +49,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Claude Meter ${{ github.ref_name }}'
+          releaseName: 'TokenTorch ${{ github.ref_name }}'
           releaseBody: 'See the assets below to download and install.'
           releaseDraft: false
           prerelease: false

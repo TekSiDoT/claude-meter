@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-const GITHUB_REPO: &str = "TekSiDoT/claude-meter";
+const GITHUB_REPO: &str = "TekSiDoT/tokentorch";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
-        .header("User-Agent", "claude-meter")
+        .header("User-Agent", "tokentorch")
         .send()
         .await
         .ok()?;

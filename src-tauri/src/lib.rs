@@ -61,8 +61,10 @@ fn hide_popup(app: AppHandle) {
     }
 }
 
-const KEYCHAIN_SERVICE: &str = "com.claude-meter.app";
+const KEYCHAIN_SERVICE: &str = "com.tokentorch.app";
 const KEYCHAIN_USER: &str = "session_key";
+// Previous keychain service name for migration
+const OLD_KEYCHAIN_SERVICE: &str = "com.claude-meter.app";
 
 fn save_session_key_to_keychain(session_key: &str) {
     match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER) {
@@ -125,6 +127,19 @@ fn load_config(app: &AppHandle) -> AppConfig {
         if let Some(val) = store.get("poll_interval_secs") {
             if let Some(n) = val.as_u64() {
                 config.poll_interval_secs = n;
+            }
+        }
+    }
+
+    // Migrate: old keychain service name → new
+    if config.session_key.is_empty() {
+        if let Ok(entry) = keyring::Entry::new(OLD_KEYCHAIN_SERVICE, KEYCHAIN_USER) {
+            if let Ok(pw) = entry.get_password() {
+                if !pw.is_empty() {
+                    config.session_key = pw.clone();
+                    save_session_key_to_keychain(&pw);
+                    let _ = entry.delete_credential();
+                }
             }
         }
     }
@@ -385,7 +400,7 @@ fn build_tray_menu(
     let open_claude =
         MenuItemBuilder::with_id("open_claude", "Open claude.ai Usage").build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings...").build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit Claude Meter").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit TokenTorch").build(app)?;
 
     builder
         .item(&refresh)
@@ -456,14 +471,14 @@ fn show_popup(app: &AppHandle, position: Option<tauri::PhysicalPosition<f64>>) {
 
     let mut builder =
         WebviewWindowBuilder::new(app, "popup", WebviewUrl::App("index.html".into()))
-            .title("Claude Meter")
-            .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
-            .resizable(false)
-            .decorations(false)
-            .always_on_top(true)
-            .visible(true)
-            .focused(true)
-            .skip_taskbar(true);
+                .title("TokenTorch")
+                .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
+                .resizable(false)
+                .decorations(false)
+                .always_on_top(true)
+                .visible(true)
+                .focused(true)
+                .skip_taskbar(true);
 
     // Position near tray icon
     if let Some(pos) = position {
@@ -494,7 +509,7 @@ fn show_setup(app: &AppHandle) {
     }
 
     let _ = WebviewWindowBuilder::new(app, "setup", WebviewUrl::App("setup.html".into()))
-        .title("Claude Meter Setup")
+        .title("TokenTorch Setup")
         .inner_size(480.0, 400.0)
         .resizable(false)
         .center()
@@ -545,7 +560,7 @@ pub fn run() {
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(icon)
                 .icon_as_template(false)
-                .tooltip("Claude Meter")
+                .tooltip("TokenTorch")
                 .show_menu_on_left_click(false)
                 .menu(&menu)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
@@ -638,7 +653,7 @@ pub fn run() {
                     "popup",
                     WebviewUrl::App("index.html".into()),
                 )
-                .title("Claude Meter")
+                .title("TokenTorch")
                 .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
                 .resizable(false)
                 .decorations(false)
