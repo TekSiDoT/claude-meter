@@ -126,7 +126,7 @@
     <p class="hint">UUID from <code>lastActiveOrg</code> cookie. Usually your personal org.</p>
   </div>
 
-  <button id="save-btn" onclick="save()">Save &amp; Connect</button>
+  <button id="save-btn">Save &amp; Connect</button>
   <div id="status"></div>
 
   <script>
@@ -179,6 +179,7 @@
       }
     }
 
+    document.getElementById('save-btn').addEventListener('click', save);
     loadExisting();
   </script>
 </body>
